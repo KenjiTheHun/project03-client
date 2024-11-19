@@ -14,7 +14,7 @@
 #
 
 import requests
-import jsons
+import json
 
 import uuid
 import pathlib
@@ -23,6 +23,7 @@ import sys
 import os
 import base64
 import time
+import random
 
 from configparser import ConfigParser
 
@@ -86,7 +87,7 @@ def web_service_get(url):
         #
         # we consider this a successful call and response
         #
-        break;
+        break
 
       #
       # failed, try again?
@@ -110,6 +111,59 @@ def web_service_get(url):
     logging.error("url: " + url)
     logging.error(e)
     return None
+  
+def web_service_post(url, json=None, data=None, headers=None):
+    """
+    Submits a POST request to a web service at most 3 times, since 
+    web services can fail to respond due to heavy traffic or other 
+    issues. If the web service responds with status code 200, 400, or 500, 
+    we consider this a valid response and return the response. 
+    Otherwise, we try again, at most 3 times. After 3 attempts, the 
+    function returns the last response.
+
+    Parameters
+    ----------
+    url : str
+        URL for calling the web service.
+    data : dict, optional
+        The data to send in the body of the POST request (default is None).
+    json : dict, optional
+        JSON data to send in the body of the POST request (default is None).
+    headers : dict, optional
+        Headers to include in the POST request (default is None).
+
+    Returns
+    -------
+    response : Response object
+        Response received from the web service, or None if the request failed.
+    """
+    try:
+        retries = 0
+
+        while True:
+            response = requests.post(url, data=data, json=json, headers=headers)
+
+            if response.status_code in [200, 400, 500]:
+                # Successful call and response
+                break
+
+            # Failed, try again
+            retries += 1
+            if retries < 3:
+                time.sleep(retries)
+                continue
+
+            # If we get here, we tried 3 times, we give up
+            break
+
+        return response
+
+    except Exception as e:
+        print("**ERROR**")
+        logging.error("web_service_post() failed:")
+        logging.error("url: " + url)
+        logging.error(e)
+        return None
     
 
 ############################################################
@@ -137,6 +191,7 @@ def prompt():
     print("   3 => reset database")
     print("   4 => upload pdf")
     print("   5 => download results")
+    print("   6 => upload pdf and poll for results")
 
     cmd = input()
 
@@ -397,6 +452,10 @@ def upload(baseurl):
 
     print("Enter user id>")
     userid = input()
+    print("userid:", userid)
+
+    api = '/pdf/' + userid
+    url = baseurl + api
 
     #
     # build the data packet. First step is read the PDF
@@ -412,9 +471,10 @@ def upload(baseurl):
     # (decode) the bytes -> string, and then we can serialize
     # the string as JSON for upload to server:
     #
-    
-    datastr = ""
-    
+
+    base64_bytes = base64.b64encode(bytes)
+    datastr = base64_bytes.decode('utf-8')
+
     # TODO: data = ???
     # TODO: datastr = ???
 
@@ -423,8 +483,8 @@ def upload(baseurl):
     #
     # call the web service:
     #
-    
-    res = None
+
+    res = web_service_post(url, json=data)
     
     # TODO: ???
 
@@ -486,13 +546,14 @@ def download(baseurl):
   try:
     print("Enter job id>")
     jobid = input()
+    url = baseurl + '/results/' + jobid
     
     #
     # call the web service:
     #
 
-    res = None
-    
+    res = web_service_get(url)
+
     # TODO ???
 
     #
@@ -525,12 +586,14 @@ def download(baseurl):
     # have results to deserialize and display:
     #
     
-    body = ""
+    body = res.json()
+    print("body:", body)
     
     # deserialize the message body:
     # TODO: body = ???
 
-    datastr = body
+    base64_bytes = base64.b64decode(body)
+    results = base64_bytes.decode()
 
     #
     # encode the data string to obtain the raw bytes in base64,
@@ -538,8 +601,6 @@ def download(baseurl):
     # Finally, decode() the bytes to obtain the results as a 
     # printable string.
     #
-    
-    results = ""
     
     # TODO: base64_bytes = ???
     # TODO: bytes = ???
@@ -553,6 +614,125 @@ def download(baseurl):
     logging.error("url: " + url)
     logging.error(e)
     return
+  
+def upload_and_poll(baseurl):
+    """
+    Prompts the user for a local filename and user id, 
+    and uploads that asset (PDF) to S3 for processing. 
+
+    Parameters
+    ----------
+    baseurl: baseurl for web service
+
+    Returns
+    -------
+    nothing
+    """
+    try:
+        print("Enter PDF filename>")
+        local_filename = input()
+
+        if not pathlib.Path(local_filename).is_file():
+            print("PDF file '", local_filename, "' does not exist...")
+            return
+
+        print("Enter user id>")
+        userid = input()
+
+        api = '/pdf/' + userid
+        url = baseurl + api
+
+        #
+        # build the data packet. First step is read the PDF
+        # as raw bytes:
+        #
+        infile = open(local_filename, "rb")
+        bytes = infile.read()
+        infile.close()
+
+        #
+        # now encode the pdf as base64. Note b64encode returns
+        # a bytes object, not a string. So then we have to convert
+        # (decode) the bytes -> string, and then we can serialize
+        # the string as JSON for upload to server:
+        #
+
+        base64_bytes = base64.b64encode(bytes)
+        datastr = base64_bytes.decode('utf-8')
+
+        data = {"filename": local_filename, "data": datastr}
+
+        #
+        # call the web service:
+
+        res = web_service_post(url, json=data)
+
+        #
+        # let's look at what we got back:
+        #
+        if res.status_code == 200:  # success
+            pass
+        elif res.status_code == 400:  # no such user
+            body = res.json()
+            print(body)
+            return
+        else:
+            # failed:
+            print("Failed with status code:", res.status_code)
+            print("url: " + url)
+            if res.status_code == 500:
+                # we'll have an error message
+                body = res.json()
+                print("Error message:", body)
+            #
+            return
+        
+        #
+        # success, extract jobid:
+        #
+        body = res.json()
+
+        jobid = body
+
+        print("PDF uploaded, job id =", jobid)
+
+        poll_url = baseurl + '/results/' + jobid
+
+        while True:
+            res = web_service_get(poll_url)
+
+            # Step 7a: Output the status code and handle errors
+            print(f"Status code: {res.status_code}")
+            if res.status_code >= 500:
+                print("Server error occurred, stopping polling.")
+                return
+            elif res.status_code == [400]:  # Bad request
+                print(f"Error: {res.json()}")
+                return
+            elif res.status_code in [480, 481]:  # Still processing
+                print(f"Job status: {res.json()}")
+            elif res.status_code == 482:  # Uploaded
+                print("error: Could not read Null object")
+                return
+            elif res.status_code == 200:  # Completed
+                # Step 7b: Extract and output the results
+                results = res.json()
+                base64_bytes = base64.b64decode(results)
+                result = base64_bytes.decode()
+                print(result)
+                return
+            else:
+                print("Unexpected status code, stopping.")
+                return
+
+            # Step 7d: Wait for a random time before next poll
+            time.sleep(random.randint(1, 5))
+
+    except Exception as e:
+        logging.error("**ERROR: upload_and_poll() failed:")
+        logging.error("url: " + url)
+        logging.error(e)
+        return
 
 
 ############################################################
@@ -630,6 +810,8 @@ try:
       upload(baseurl)
     elif cmd == 5:
       download(baseurl)
+    elif cmd == 6:
+      upload_and_poll(baseurl)
     else:
       print("** Unknown command, try again...")
     #
